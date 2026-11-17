@@ -14,8 +14,18 @@ from importlib.metadata import version
 from io import StringIO
 from json import dumps as json_dumps
 from pathlib import Path
+from typing import Any
 
-from lxml.etree import DTD, Element, SubElement, XMLParser, _Element, fromstring, tostring
+from lxml.etree import (
+    DTD,
+    Element,
+    SubElement,
+    XMLParser,
+    _Element,
+    fromstring,
+    strip_tags,
+    tostring,
+)
 
 from .settings import INLINE_CARRIED, INLINE_CONSUMING, INLINE_FORMATTABLE, Document, Extractor
 from .utils import sanitize, sanitize_tree, text_chars_test
@@ -46,6 +56,7 @@ TEI_VALID_TAGS = {
 }
 TEI_VALID_ATTRS = {"rend", "rendition", "role", "target", "type", "url"}
 TEI_DTD = None  # to be downloaded later if necessary
+TEI_CHILDREN: dict[str, frozenset[str]] | None = None  # element name -> allowed child names, from TEI_DTD
 TEI_REMOVE_TAIL = {"ab", "p"}
 TEI_DIV_SIBLINGS = {"p", "list", "table", "quote", "ab"}
 
@@ -139,14 +150,22 @@ def delete_element(element: _Element, keep_tail: bool = True) -> None:
     parent.remove(element)
 
 
-def merge_with_parent(element: _Element, include_formatting: bool = False) -> None:
-    """Merge element with its parent and convert formatting to markdown."""
+def merge_with_parent(element: _Element, include_formatting: bool = False, keep_children: bool = False) -> None:
+    """Merge element with its parent and convert formatting to markdown.
+    With keep_children, children the parent may contain move up, the others are stripped and keep their text."""
     parent = element.getparent()
     if parent is None:
         return
 
+    children = []
+    if keep_children:
+        # stripping a child brings up its own children, which need the same check
+        while banned := {str(child.tag) for child in element if not _may_contain(parent, element, child)}:
+            strip_tags(element, *banned)
+        children = list(element)
+
     full_text = replace_element_text(element, include_formatting)
-    if element.tail is not None:
+    if element.tail is not None and not children:
         full_text += element.tail
 
     previous = element.getprevious()
@@ -157,7 +176,37 @@ def merge_with_parent(element: _Element, include_formatting: bool = False) -> No
         parent.text = f"{parent.text} {full_text}"
     else:
         parent.text = full_text
+    if children:
+        children[-1].tail = (children[-1].tail or "") + (element.tail or "")
+        index = parent.index(element)
+        for offset, child in enumerate(children):
+            parent.insert(index + offset, child)
     parent.remove(element)
+
+
+def _may_contain(parent: _Element, element: _Element, child: _Element) -> bool:
+    "Whether the child of an element merged into the parent can move up without breaking the TEI content model."
+    if parent.tag == element.tag:
+        return True
+    allowed = _tei_children(str(parent.tag))
+    return allowed is not None and child.tag in allowed
+
+
+def _tei_children(tag: str) -> frozenset[str] | None:
+    "Names of the elements the TEI schema allows in the tag, None if the schema does not define it."
+    global TEI_CHILDREN
+
+    if TEI_CHILDREN is None:
+        TEI_CHILDREN = {d.name: frozenset(_declared_names(d.content)) for d in _load_tei_dtd().elements() if d.name}
+    return TEI_CHILDREN.get(tag)
+
+
+def _declared_names(content: Any) -> set[str]:
+    "Element names in a DTD content model."
+    if content is None:
+        return set()
+    names = {content.name} if content.type == "element" and content.name else set()
+    return names | _declared_names(content.left) | _declared_names(content.right)
 
 
 def separates_inline(element: _Element) -> bool:
@@ -203,7 +252,7 @@ def strip_double_tags(tree: _Element) -> _Element:
     for elem in reversed(tree.xpath(".//head | .//code | .//p")):
         for subelem in elem.iterdescendants("code", "head", "p"):
             if subelem.tag == elem.tag and subelem.getparent().tag not in NESTING_WHITELIST:
-                merge_with_parent(subelem)
+                merge_with_parent(subelem, keep_children=True)
     return tree
 
 
@@ -339,17 +388,22 @@ def check_tei(xmldoc: _Element, url: str | None) -> _Element:
 
 def validate_tei(xmldoc: _Element) -> bool:
     """Check if an XML document is conform to the guidelines of the Text Encoding Initiative"""
+    dtd = _load_tei_dtd()
+    result = dtd.validate(xmldoc)
+    if result is False:
+        LOGGER.warning("not a valid TEI document: %s", dtd.error_log.last_error)
+
+    return result
+
+
+def _load_tei_dtd() -> DTD:
+    "The TEI schema, loaded on first use."
     global TEI_DTD
 
     if TEI_DTD is None:
         # https://tei-c.org/release/xml/tei/custom/schema/dtd/tei_corpus.dtd
         TEI_DTD = DTD(TEI_SCHEMA)
-
-    result = TEI_DTD.validate(xmldoc)
-    if result is False:
-        LOGGER.warning("not a valid TEI document: %s", TEI_DTD.error_log.last_error)
-
-    return result
+    return TEI_DTD
 
 
 def _code_fence(text: str, min_len: int = 1) -> str:

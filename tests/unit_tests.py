@@ -1854,6 +1854,35 @@ def test_tei():
         assert tree.find(f".//{parent_tag}/p") is not None
 
 
+@pytest.mark.parametrize("output_format", ["xml", "xmltei"])
+def test_nested_code_keeps_its_lines(output_format):
+    "A code block nested in another keeps its line breaks in XML and TEI output (#966)."
+    filler = "<p>Some long enough filler text to be extracted properly here, again and again for length.</p>"
+    code = "<pre><code>def f():<br>    return 1<br>print(f())</code></pre>"
+    result = extract(
+        f"<html><body><article>{filler}{code}</article></body></html>", output_format=output_format, include_formatting=True
+    )
+    assert "<code>def f():<lb/>    return 1<lb/>print(f())</code>" in result
+
+
+@pytest.mark.parametrize(
+    "src,expected",
+    [
+        ("<doc><code>a<code>x<lb/>y</code> tail</code></doc>", "<doc><code>a x<lb/>y tail</code></doc>"),
+        ("<doc><head>a<head>x<hi>b</hi>y</head> tail</head></doc>", "<doc><head>a x<hi>b</hi>y tail</head></doc>"),
+        # the table cannot go into hi, so it loses its tags but keeps its text
+        (
+            "<doc><p>a<hi>b<p>x<table><row><cell>t</cell></row></table>y<lb/>z</p>c</hi>d</p></doc>",
+            "<doc><p>a<hi>b xty<lb/>zc</hi>d</p></doc>",
+        ),
+    ],
+)
+def test_strip_double_tags_keeps_children(src, expected):
+    "Merging a nested element moves up the children its new parent may contain and strips the others (#966)."
+    tree = xml.strip_double_tags(etree.fromstring(src))
+    assert etree.tostring(tree, encoding="unicode") == expected
+
+
 @pytest.mark.parametrize(
     "div,expected",
     [
